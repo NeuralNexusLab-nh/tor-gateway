@@ -61,6 +61,11 @@ http {
     server_tokens off;
     sendfile on;
 
+    # Onion hostname 很長，避免 nginx map hash bucket 不夠大
+    map_hash_bucket_size 256;
+    map_hash_max_size 2048;
+
+
     # --------------------------------------------------------
     # Privacy-friendly access log
     #
@@ -104,7 +109,7 @@ http {
     map $host $upstream {
         default "";
 
-        # nxlabtw
+        # NXLabTW root
         "__ONION__"              "__NXLABTW__";
         "www.__ONION__"          "__NXLABTW__";
 
@@ -157,9 +162,7 @@ http {
 
             proxy_set_header Host $host;
 
-            # Tor Onion Service 不會提供使用者真實 IP。
-            #
-            # 不偽造來源 IP，統一標示 localhost。
+            # Tor Onion Service 不會提供訪客原始 IP
             proxy_set_header X-Real-IP 127.0.0.1;
             proxy_set_header X-Forwarded-For 127.0.0.1;
 
@@ -211,7 +214,7 @@ RUN cat <<'ENTRYPOINT' > /usr/local/bin/entrypoint.sh
 
 set -eu
 
-# 新建立檔案預設只有 owner 可以讀寫。
+# 新建立的敏感檔案預設只有 owner 可讀寫
 umask 077
 
 
