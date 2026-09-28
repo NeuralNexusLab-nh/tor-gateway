@@ -2,11 +2,6 @@
 
 FROM alpine:3.20
 
-
-# ============================================================
-# Packages / directories
-# ============================================================
-
 RUN apk add --no-cache \
       tor \
       nginx \
@@ -61,68 +56,66 @@ http {
     server_tokens off;
     sendfile on;
 
-    # Onion hostname 很長，避免 nginx map hash bucket 不夠大
+    # Long Onion hostnames need a larger map hash bucket.
     map_hash_bucket_size 256;
     map_hash_max_size 2048;
 
-
-    # --------------------------------------------------------
-    # Privacy-friendly access log
-    #
-    # 不記：
-    # - query string
-    # - cookies
-    # - user-agent
-    # - referer
-    #
-    # 避免 reset token / auth token 被丟進 logs。
-    # --------------------------------------------------------
-
+    # Privacy-friendly access log.
+    # Does not log query strings, cookies, UA, referer, etc.
     log_format privacy
         '$time_iso8601 $host "$request_method $uri" '
         '$status $body_bytes_sent';
 
     access_log /dev/stdout privacy;
 
-
-    # --------------------------------------------------------
-    # Kubernetes / Zeabur internal DNS resolver
-    # --------------------------------------------------------
-
+    # Zeabur / Kubernetes internal DNS.
     resolver __RESOLVER__ valid=30s ipv6=off;
+    resolver_timeout 5s;
 
-
-    # --------------------------------------------------------
-    # WebSocket support
-    # --------------------------------------------------------
-
+    # WebSocket support.
     map $http_upgrade $connection_upgrade {
         default upgrade;
         ''      close;
     }
 
 
-    # --------------------------------------------------------
-    # Onion virtual host routing
-    # --------------------------------------------------------
+    # ========================================================
+    # Onion Host -> Upstream
+    # ========================================================
 
     map $host $upstream {
         default "";
 
-        # NXLabTW root
+        # ----------------------------------------------------
+        # Existing fixed routes
+        # ----------------------------------------------------
+
         "__ONION__"              "__NXLABTW__";
         "www.__ONION__"          "__NXLABTW__";
 
-        # NexaCAPTCHA
+        "astranote.__ONION__"    "__ASTRANOTE__";
         "nexacaptcha.__ONION__"  "__NEXACAPTCHA__";
 
-        # AstraNote
-        "astranote.__ONION__"    "__ASTRANOTE__";
+
+        # ----------------------------------------------------
+        # Dynamically generated routes
+        #
+        # Example env:
+        #
+        # SATORA_UPSTREAM=satora.zeabur.internal:8080
+        #
+        # Generates:
+        #
+        # "satora.<onion>"
+        #     "satora.zeabur.internal:8080";
+        # ----------------------------------------------------
+
+        include /etc/nginx/onion-routes.conf;
     }
 
 
     # ========================================================
-    # Main reverse proxy
+    # Onion HTTP server
     # ========================================================
 
     server {
@@ -131,12 +124,11 @@ http {
 
 
         # ----------------------------------------------------
-        # Health check
+        # Health endpoint
         # ----------------------------------------------------
 
         location = /_health {
             access_log off;
-
             default_type text/plain;
             return 200 "ok\n";
         }
@@ -147,56 +139,33 @@ http {
         # ----------------------------------------------------
 
         location / {
-
-            # Unknown Host → 404
+            # No matching Onion route.
             if ($upstream = "") {
                 return 404;
             }
 
             proxy_http_version 1.1;
 
-
-            # ------------------------------------------------
-            # Headers
-            # ------------------------------------------------
-
+            # Preserve the Onion Host header.
             proxy_set_header Host $host;
 
-            # Tor Onion Service 不會提供訪客原始 IP
+            # Onion Services do not expose the user's real IP.
             proxy_set_header X-Real-IP 127.0.0.1;
             proxy_set_header X-Forwarded-For 127.0.0.1;
 
             proxy_set_header X-Forwarded-Proto http;
             proxy_set_header X-Forwarded-Host $host;
 
-
-            # ------------------------------------------------
-            # WebSocket
-            # ------------------------------------------------
-
+            # WebSockets
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;
 
-
-            # ------------------------------------------------
             # Timeouts
-            # ------------------------------------------------
-
-            proxy_connect_timeout 30s;
+            proxy_connect_timeout 10s;
             proxy_read_timeout 300s;
             proxy_send_timeout 300s;
 
-
-            # ------------------------------------------------
-            # Upload size
-            # ------------------------------------------------
-
             client_max_body_size 100m;
-
-
-            # ------------------------------------------------
-            # Dynamic Zeabur internal upstream
-            # ------------------------------------------------
 
             proxy_pass http://$upstream$request_uri;
         }
@@ -213,8 +182,6 @@ RUN cat <<'ENTRYPOINT' > /usr/local/bin/entrypoint.sh
 #!/bin/sh
 
 set -eu
-
-# 新建立的敏感檔案預設只有 owner 可讀寫
 umask 077
 
 
@@ -240,18 +207,74 @@ fi
 
 
 # ============================================================
-# Upstreams
+# Existing explicit upstreams
 # ============================================================
 
 NXLABTW_UPSTREAM="${NXLABTW_UPSTREAM:-nxlabtw.zeabur.internal:8080}"
 
-NEXACAPTCHA_UPSTREAM="${NEXACAPTCHA_UPSTREAM:-nexacaptcha.zeabur.internal:8080}"
-
 ASTRANOTE_UPSTREAM="${ASTRANOTE_UPSTREAM:-astranote.zeabur.internal:8080}"
+
+NEXACAPTCHA_UPSTREAM="${NEXACAPTCHA_UPSTREAM:-nexacaptcha.zeabur.internal:8080}"
 
 
 # ============================================================
-# Tor Hidden Service keys
+# Validate an upstream
+#
+# Allowed:
+#
+# hostname:port
+#
+# Examples:
+#
+# satora.zeabur.internal:8080
+# api.zeabur.internal:3000
+# 10.0.0.10:8080
+#
+# This deliberately does NOT allow:
+#
+# http://
+# /
+# ;
+# spaces
+# nginx syntax
+#
+# because these values are inserted into nginx.conf.
+# ============================================================
+
+validate_upstream() {
+    VALUE="$1"
+
+    if ! printf '%s\n' "$VALUE" \
+        | grep -Eq '^[A-Za-z0-9.-]+:[0-9]{1,5}$'; then
+        return 1
+    fi
+
+    PORT="${VALUE##*:}"
+
+    if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+
+# Validate the three built-in upstreams too.
+
+for VALUE in \
+    "$NXLABTW_UPSTREAM" \
+    "$ASTRANOTE_UPSTREAM" \
+    "$NEXACAPTCHA_UPSTREAM"
+do
+    if ! validate_upstream "$VALUE"; then
+        echo "[init] ERROR: invalid built-in upstream: ${VALUE}"
+        exit 1
+    fi
+done
+
+
+# ============================================================
+# Materialise Tor Onion Service identity
 # ============================================================
 
 HS_DIR="/var/lib/tor/hs"
@@ -259,28 +282,27 @@ DATA_DIR="/var/lib/tor/data"
 
 echo "[init] materialising hidden-service keys"
 
-mkdir -p "$HS_DIR" "$DATA_DIR"
+mkdir -p \
+    "$HS_DIR" \
+    "$DATA_DIR"
 
 
-# Secret key
 printf '%s' "$HS_SECRET_KEY_B64" \
     | base64 -d \
     > "$HS_DIR/hs_ed25519_secret_key"
 
 
-# Public key
 printf '%s' "$HS_PUBLIC_KEY_B64" \
     | base64 -d \
     > "$HS_DIR/hs_ed25519_public_key"
 
 
-# Hostname
 printf '%s\n' "$ONION_ADDRESS" \
     > "$HS_DIR/hostname"
 
 
 # ============================================================
-# Validate key sizes
+# Validate Tor key file sizes
 # ============================================================
 
 SECRET_SIZE="$(
@@ -321,7 +343,7 @@ chmod 600 "$HS_DIR/hostname"
 
 
 # ============================================================
-# Nginx permissions
+# Nginx directories
 # ============================================================
 
 mkdir -p \
@@ -334,7 +356,7 @@ chown -R nginx:nginx \
 
 
 # ============================================================
-# Detect DNS resolver
+# Detect Zeabur / Kubernetes DNS resolver
 # ============================================================
 
 RESOLVER="$(
@@ -351,25 +373,154 @@ if [ -z "$RESOLVER" ]; then
     RESOLVER="10.43.0.20"
 fi
 
+
 echo "[init] nginx resolver: ${RESOLVER}"
+echo "[init] onion address: ${ONION_ADDRESS}"
 
 
 # ============================================================
-# Generate nginx.conf
+# Generate dynamic Onion routes from environment variables
+# ============================================================
+
+ROUTES_FILE="/etc/nginx/onion-routes.conf"
+SEEN_FILE="/tmp/onion-routes-seen"
+
+: > "$ROUTES_FILE"
+: > "$SEEN_FILE"
+
+
+echo "[routes] scanning *_UPSTREAM environment variables"
+
+
+env | while IFS='=' read -r ENV_NAME ENV_VALUE
+do
+    # Environment variable matching is intentionally
+    # case-insensitive.
+    #
+    # Examples:
+    #
+    # SATORA_UPSTREAM
+    # satora_upstream
+    # SaToRa_UpStReAm
+    #
+    # all become:
+    #
+    # satora
+
+    LOWER_NAME="$(
+        printf '%s' "$ENV_NAME" \
+        | tr '[:upper:]' '[:lower:]'
+    )"
+
+
+    case "$LOWER_NAME" in
+        *_upstream)
+
+            SUBDOMAIN="${LOWER_NAME%_upstream}"
+
+
+            # ------------------------------------------------
+            # These routes already have explicit definitions.
+            # Do not dynamically regenerate them.
+            # ------------------------------------------------
+
+            case "$SUBDOMAIN" in
+                nxlabtw|www|astranote|nexacaptcha)
+                    continue
+                    ;;
+            esac
+
+
+            # ------------------------------------------------
+            # Validate Onion subdomain
+            # ------------------------------------------------
+
+            if ! printf '%s\n' "$SUBDOMAIN" \
+                | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'; then
+
+                echo "[routes] SKIP invalid subdomain from ${ENV_NAME}: ${SUBDOMAIN}"
+                continue
+            fi
+
+
+            # ------------------------------------------------
+            # Reject duplicated route names
+            #
+            # Example:
+            #
+            # SATORA_UPSTREAM=...
+            # satora_upstream=...
+            #
+            # Since matching is case-insensitive, these are
+            # considered the same route.
+            # ------------------------------------------------
+
+            if grep -Fxq "$SUBDOMAIN" "$SEEN_FILE"; then
+                echo "[routes] SKIP duplicate route: ${SUBDOMAIN}"
+                continue
+            fi
+
+
+            # ------------------------------------------------
+            # Validate upstream before writing it into Nginx
+            # configuration.
+            # ------------------------------------------------
+
+            if ! validate_upstream "$ENV_VALUE"; then
+                echo "[routes] SKIP invalid upstream for ${SUBDOMAIN}: ${ENV_VALUE}"
+                continue
+            fi
+
+
+            printf '%s\n' "$SUBDOMAIN" >> "$SEEN_FILE"
+
+
+            # ------------------------------------------------
+            # Generate map entry
+            # ------------------------------------------------
+
+            printf '"%s.%s" "%s";\n' \
+                "$SUBDOMAIN" \
+                "$ONION_ADDRESS" \
+                "$ENV_VALUE" \
+                >> "$ROUTES_FILE"
+
+
+            echo "[routes] ${SUBDOMAIN}.${ONION_ADDRESS} -> ${ENV_VALUE}"
+            ;;
+
+    esac
+done
+
+
+# ============================================================
+# Show route count
+# ============================================================
+
+ROUTE_COUNT="$(
+    wc -l < "$ROUTES_FILE" \
+    | tr -d '[:space:]'
+)"
+
+echo "[routes] generated ${ROUTE_COUNT} dynamic Onion route(s)"
+
+
+# ============================================================
+# Generate final Nginx config
 # ============================================================
 
 sed \
     -e "s|__RESOLVER__|${RESOLVER}|g" \
     -e "s|__ONION__|${ONION_ADDRESS}|g" \
     -e "s|__NXLABTW__|${NXLABTW_UPSTREAM}|g" \
-    -e "s|__NEXACAPTCHA__|${NEXACAPTCHA_UPSTREAM}|g" \
     -e "s|__ASTRANOTE__|${ASTRANOTE_UPSTREAM}|g" \
+    -e "s|__NEXACAPTCHA__|${NEXACAPTCHA_UPSTREAM}|g" \
     /etc/nginx/nginx.conf.template \
     > /etc/nginx/nginx.conf
 
 
 # ============================================================
-# Validate nginx
+# Validate Nginx configuration
 # ============================================================
 
 echo "[init] validating nginx configuration"
@@ -378,7 +529,7 @@ nginx -t
 
 
 # ============================================================
-# Start nginx
+# Start Nginx
 # ============================================================
 
 echo "[init] starting nginx"
@@ -390,7 +541,7 @@ nginx
 # Start Tor
 # ============================================================
 
-echo "[init] starting Tor hidden service"
+echo "[init] starting Tor Onion Service"
 echo "[init] onion address: ${ONION_ADDRESS}"
 
 exec su-exec tor tor -f /etc/tor/torrc
@@ -400,12 +551,12 @@ ENTRYPOINT
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 
-# ============================================================
-# Runtime
-# ============================================================
-
 EXPOSE 8080
 
+
+# ============================================================
+# Health check
+# ============================================================
 
 HEALTHCHECK \
     --interval=30s \
